@@ -14,9 +14,11 @@ try:
 except ImportError:
     sys.exit("Install python-evdev: sudo pacman -S python-evdev")
 
-DEVICE_NAME = "Wacom Pen and multitouch sensor Finger"
-EDGE_FRACTION = 0.06   # top/bottom 6% of sensor height counts as edge
-HIDE_DELAY    = 5.0    # seconds before hiding
+DEVICE_NAME    = "Wacom Pen and multitouch sensor Finger"
+EDGE_FRACTION  = 0.06   # top/bottom 6% of sensor height counts as edge
+MIN_TRAVEL     = 150    # finger must move this many units inward to count as a real swipe
+MIN_DURATION   = 0.08   # real swipe takes at least 80ms; digitizer phantom is near-instant
+HIDE_DELAY     = 5.0    # seconds before hiding
 
 HIDE_SCRIPT = (
     "for(var i=0;i<panelIds.length;i++){"
@@ -58,7 +60,9 @@ class TouchHider:
         self._timer = None
         self._lock = threading.Lock()
         self._current_slot = 0
-        self._slot_start_y = {}
+        self._slot_start_y  = {}  # slot -> initial Y when finger went down
+        self._slot_cur_y    = {}  # slot -> most recent Y (tracks travel)
+        self._slot_start_ts = {}  # slot -> monotonic timestamp when finger went down
         self._pending_slots = set()
 
     def _schedule(self):
@@ -78,24 +82,40 @@ class TouchHider:
 
         elif event.code == ecodes.ABS_MT_TRACKING_ID:
             if event.value == -1:
-                start_y = self._slot_start_y.pop(self._current_slot, None)
+                import time as _time
+                start_y  = self._slot_start_y.pop(self._current_slot, None)
+                cur_y    = self._slot_cur_y.pop(self._current_slot, start_y)
+                start_ts = self._slot_start_ts.pop(self._current_slot, None)
                 self._pending_slots.discard(self._current_slot)
+
                 if start_y is not None:
                     is_top    = start_y <= self.edge
                     is_bottom = start_y >= (self.max_y - self.edge)
                     if is_top or is_bottom:
-                        edge_name = "top" if is_top else "bottom"
-                        print(f"[touch-hider] edge swipe from {edge_name} "
-                              f"(y={start_y}), hiding in {HIDE_DELAY}s", flush=True)
-                        self._schedule()
+                        travel   = cur_y - start_y if is_top else start_y - cur_y
+                        duration = (_time.monotonic() - start_ts) if start_ts else 0
+                        if travel >= MIN_TRAVEL and duration >= MIN_DURATION:
+                            edge_name = "top" if is_top else "bottom"
+                            print(f"[touch-hider] edge swipe from {edge_name} "
+                                  f"(start={start_y}, end={cur_y}, "
+                                  f"travel={travel}, dur={duration:.3f}s), "
+                                  f"hiding in {HIDE_DELAY}s", flush=True)
+                            self._schedule()
+                        else:
+                            print(f"[touch-hider] ignored "
+                                  f"(start={start_y}, end={cur_y}, "
+                                  f"travel={travel}, dur={duration:.3f}s)", flush=True)
             else:
                 self._slot_start_y.pop(self._current_slot, None)
+                self._slot_cur_y.pop(self._current_slot, None)
+                self._slot_start_ts[self._current_slot] = __import__('time').monotonic()
                 self._pending_slots.add(self._current_slot)
 
         elif event.code == ecodes.ABS_MT_POSITION_Y:
             if self._current_slot in self._pending_slots:
                 self._slot_start_y[self._current_slot] = event.value
                 self._pending_slots.discard(self._current_slot)
+            self._slot_cur_y[self._current_slot] = event.value
 
 def main():
     dev = find_touch_device()
@@ -104,7 +124,8 @@ def main():
 
     max_y = dev.absinfo(ecodes.ABS_MT_POSITION_Y).max
     hider = TouchHider(max_y)
-    print(f"[touch-hider] watching {dev.name} (max_y={max_y}, edge={hider.edge})", flush=True)
+    print(f"[touch-hider] watching {dev.name} "
+          f"(max_y={max_y}, edge={hider.edge}, min_travel={MIN_TRAVEL})", flush=True)
 
     try:
         for event in dev.read_loop():
