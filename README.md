@@ -4,11 +4,11 @@ Fixes KDE Plasma panels staying open after a touchscreen edge swipe gesture.
 
 ## Problem
 
-In KDE Plasma 6 (Wayland), panels set to **Dodge Windows** or **Auto-hide** mode can be revealed by swiping from the screen edge. However, when triggered by touch (rather than mouse), the panel never hides again — it stays visible until you click something. This is an architectural gap in the `kde-plasma-shell` Wayland protocol, which only defines pointer-based hiding triggers, with no equivalent for touch input.
+In KDE Plasma 6 (Wayland), panels set to **Dodge Windows** or **Auto-hide** mode can be revealed by swiping from the screen edge. However, when triggered by touch (rather than mouse), the panel never hides again - it stays visible until you click something. This is an architectural gap in the `kde-plasma-shell` Wayland protocol, which only defines pointer-based hiding triggers, with no equivalent for touch input.
 
 ## Solution
 
-A small Python daemon reads raw touch events directly from the touchscreen (`/dev/input/eventX`, via `python-evdev`) — parallel to KWin, without interfering with it. When it detects a swipe gesture that started from the top or bottom edge, it waits 5 seconds, then forces plasmashell to re-evaluate panel visibility via DBus. This causes panels to re-hide if a window is covering them (as they should in Dodge Windows mode).
+A small Python daemon reads raw touch events directly from the touchscreen (`/dev/input/eventX`, via `python-evdev`) in parallel with KWin, without interfering with it. When it detects a swipe gesture that started from the top or bottom edge, it waits 5 seconds, then triggers KWin to re-evaluate panel visibility via DBus. Panels hide only if a window is actually overlapping them - on the empty desktop they stay visible.
 
 Mouse hover behavior is completely unaffected.
 
@@ -44,9 +44,9 @@ systemctl --user enable --now plasma-panel-touch-hider.service
 Edit `plasma-panel-touch-hider` and adjust at the top:
 
 ```python
-DEVICE_NAME    = "Wacom Pen and multitouch sensor Finger"  # your touch device name
-EDGE_FRACTION  = 0.06   # swipe must start within 6% of screen edge
-HIDE_DELAY     = 5.0    # seconds before hiding
+DEVICE_NAME   = "Wacom Pen and multitouch sensor Finger"  # your touch device name
+EDGE_FRACTION = 0.06   # swipe must start within 6% of screen edge
+HIDE_DELAY    = 5.0    # seconds before hiding
 ```
 
 Find your device name with:
@@ -62,11 +62,7 @@ cat /proc/bus/input/devices
 2. Records the Y coordinate of each new touch contact
 3. When the finger lifts (`TRACKING_ID = -1`), checks if it started near the top or bottom edge
 4. If yes, schedules a 5-second timer
-5. On timer fire, calls:
-   ```
-   qdbus6 org.kde.plasmashell /PlasmaShell evaluateScript "..."
-   ```
-   which toggles each panel's hiding mode (`none` → original mode), forcing KWin to re-evaluate window positions and hide the panel
+5. On timer fire, calls `qdbus6 org.kde.plasmashell evaluateScript` which toggles each panel's hiding mode between `dodgewindows` and `dodgeactive` - this triggers KWin to re-evaluate window positions from the current visible state, hiding the panel only if a window actually overlaps it
 
 ## Tested on
 
