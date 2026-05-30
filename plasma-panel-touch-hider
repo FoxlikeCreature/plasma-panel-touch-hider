@@ -24,7 +24,14 @@ HIDE_SCRIPT = (
     "for(var i=0;i<panelIds.length;i++){"
     "var p=panelById(panelIds[i]);"
     "var m=p.hiding;"
-    "if(m==='dodgewindows'||m==='autohide'||m==='dodgeactive'){"
+    "if(m==='dodgewindows'||m==='dodgeactive'){"
+    # Переключаем между dodgewindows↔dodgeactive чтобы триггернуть
+    # re-evaluation без прохода через 'none' (который сбрасывает в hidden).
+    # KWin пересчитает с текущего видимого состояния → спрячет только если
+    # окно реально перекрывает панель.
+    "var alt=m==='dodgewindows'?'dodgeactive':'dodgewindows';"
+    "p.hiding=alt;p.hiding=m;}"
+    "else if(m==='autohide'){"
     "p.hiding='none';p.hiding=m;}}"
 )
 
