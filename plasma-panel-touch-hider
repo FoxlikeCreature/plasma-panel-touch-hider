@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""
+Скрывает KDE Plasma панели через 5 секунд после жеста с края экрана (touch).
+Работает параллельно с KWin, читая сырые evdev события.
+Поведение мыши не затрагивает.
+"""
+
+import subprocess
+import threading
+import time
+import sys
+
+try:
+    import evdev
+    from evdev import ecodes
+except ImportError:
+    sys.exit("Установи python-evdev: sudo pacman -S python-evdev")
+
+DEVICE_NAME = "Wacom Pen and multitouch sensor Finger"
+EDGE_FRACTION = 0.06   # 6% от высоты сенсора считается "край"
+HIDE_DELAY    = 5.0    # секунд до скрытия
+
+HIDE_SCRIPT = (
+    "for(var i=0;i<panelIds.length;i++){"
+    "var p=panelById(panelIds[i]);"
+    "var m=p.hiding;"
+    "if(m==='dodgewindows'||m==='autohide'||m==='dodgeactive'){"
+    "p.hiding='none';p.hiding=m;}}"
+)
+
+def find_touch_device():
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+            if dev.name == DEVICE_NAME:
+                return dev
+            dev.close()
+        except (PermissionError, OSError):
+            pass
+    return None
+
+def do_hide():
+    subprocess.run(
+        ["qdbus6", "org.kde.plasmashell", "/PlasmaShell",
+         "org.kde.PlasmaShell.evaluateScript", HIDE_SCRIPT],
+        capture_output=True
+    )
+
+class TouchHider:
+    def __init__(self, max_y):
+        self.edge = int(max_y * EDGE_FRACTION)
+        self.max_y = max_y
+        self._timer = None
+        self._lock = threading.Lock()
+        # slot state
+        self._current_slot = 0
+        self._slot_start_y = {}   # slot -> initial Y when finger went down
+        self._pending_slots = set()  # slots waiting for their first Y event
+
+    def _schedule(self):
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+            self._timer = threading.Timer(HIDE_DELAY, do_hide)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def feed(self, event):
+        if event.type != ecodes.EV_ABS:
+            return
+
+        if event.code == ecodes.ABS_MT_SLOT:
+            self._current_slot = event.value
+
+        elif event.code == ecodes.ABS_MT_TRACKING_ID:
+            if event.value == -1:
+                # палец поднят
+                start_y = self._slot_start_y.pop(self._current_slot, None)
+                self._pending_slots.discard(self._current_slot)
+                if start_y is not None:
+                    is_top    = start_y <= self.edge
+                    is_bottom = start_y >= (self.max_y - self.edge)
+                    if is_top or is_bottom:
+                        edge_name = "top" if is_top else "bottom"
+                        print(f"[touch-hider] edge swipe from {edge_name} "
+                              f"(y={start_y}), hiding in {HIDE_DELAY}s", flush=True)
+                        self._schedule()
+            else:
+                # новый палец — запоминаем слот, ждём первый Y
+                self._slot_start_y.pop(self._current_slot, None)
+                self._pending_slots.add(self._current_slot)
+
+        elif event.code == ecodes.ABS_MT_POSITION_Y:
+            if self._current_slot in self._pending_slots:
+                self._slot_start_y[self._current_slot] = event.value
+                self._pending_slots.discard(self._current_slot)
+
+def main():
+    dev = find_touch_device()
+    if dev is None:
+        sys.exit(f"Устройство '{DEVICE_NAME}' не найдено или нет прав (нужна группа input)")
+
+    max_y = dev.absinfo(ecodes.ABS_MT_POSITION_Y).max
+    hider = TouchHider(max_y)
+    print(f"[touch-hider] слежу за {dev.name} (max_y={max_y}, edge={hider.edge})", flush=True)
+
+    try:
+        for event in dev.read_loop():
+            hider.feed(event)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        dev.close()
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,14 @@
+[Unit]
+Description=Plasma Panel Touch Auto-Hider
+After=plasma-core.target
+PartOf=plasma-core.target
+
+[Service]
+ExecStart=sg input -c '%h/.local/bin/plasma-panel-touch-hider'
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=plasma-core.target
