@@ -50,19 +50,13 @@ def find_touch_device():
             pass
     return None
 
-def do_hide():
-    subprocess.run(
-        ["qdbus6", "org.kde.plasmashell", "/PlasmaShell",
-         "org.kde.PlasmaShell.evaluateScript", HIDE_SCRIPT],
-        capture_output=True
-    )
-
-def get_display_rotation():
-    """Returns display rotation in degrees (0, 90, 180, 270). Falls back to 0 on error.
+def get_display_info():
+    """Returns dict with rotation (degrees) and logical screen center. Falls back on error.
 
     KScreen rotation flags: 1=None(0), 2=Left(90 CCW), 4=Inverted(180), 8=Right(90 CW).
     Portrait top corresponds to sensor X=0 for Left/CCW, X=max_x for Right/CW.
     """
+    info = {'rotation': 0, 'center_x': 640, 'center_y': 360}
     try:
         r = subprocess.run(
             ['kscreen-doctor', '-j'],
@@ -70,10 +64,16 @@ def get_display_rotation():
         )
         for out in json.loads(r.stdout).get('outputs', []):
             if out.get('enabled'):
-                return {1: 0, 2: 90, 4: 180, 8: 270}.get(out.get('rotation', 1), 0)
+                rot = out.get('rotation', 1)
+                info['rotation'] = {1: 0, 2: 90, 4: 180, 8: 270}.get(rot, 0)
+                size  = out.get('size', {})
+                scale = max(out.get('scale', 1), 1)
+                info['center_x'] = int(size.get('width', 1280) / scale / 2)
+                info['center_y'] = int(size.get('height', 720) / scale / 2)
+                break
     except Exception:
         pass
-    return 0
+    return info
 
 class TouchHider:
     def __init__(self, max_x, max_y):
@@ -91,22 +91,44 @@ class TouchHider:
         self._slot_start_ts = {}
         self._pending_y_slots = set()
         self._pending_x_slots = set()
-        self._rotation = get_display_rotation()
+        info = get_display_info()
+        self._rotation = info['rotation']
+        self._center_x = info['center_x']
+        self._center_y = info['center_y']
         threading.Thread(target=self._rotation_poll, daemon=True).start()
 
     def _rotation_poll(self):
         while True:
             time.sleep(ROTATION_POLL)
-            rot = get_display_rotation()
-            if rot != self._rotation:
-                self._rotation = rot
-                print(f"[touch-hider] rotation changed to {rot}°", flush=True)
+            info = get_display_info()
+            if info['rotation'] != self._rotation:
+                self._rotation = info['rotation']
+                print(f"[touch-hider] rotation changed to {self._rotation}°", flush=True)
+            self._center_x = info['center_x']
+            self._center_y = info['center_y']
+
+    def _do_hide(self):
+        # Move pointer away from panel edge to clear any stuck touch-synthesized hover.
+        # Touch taps on panel icons leave the synthetic pointer at the icon position,
+        # preventing KWin from hiding the panel even when a window is covering it.
+        result = subprocess.run(
+            ['ydotool', 'mousemove', '--absolute',
+             f'-x{self._center_x}', f'-y{self._center_y}'],
+            capture_output=True
+        )
+        if result.returncode == 0:
+            time.sleep(0.1)
+        subprocess.run(
+            ["qdbus6", "org.kde.plasmashell", "/PlasmaShell",
+             "org.kde.PlasmaShell.evaluateScript", HIDE_SCRIPT],
+            capture_output=True
+        )
 
     def _schedule(self):
         with self._lock:
             if self._timer is not None:
                 self._timer.cancel()
-            self._timer = threading.Timer(HIDE_DELAY, do_hide)
+            self._timer = threading.Timer(HIDE_DELAY, self._do_hide)
             self._timer.daemon = True
             self._timer.start()
 
@@ -206,7 +228,8 @@ def main():
     print(f"[touch-hider] watching {dev.name} "
           f"(max_y={max_y}, edge_y={hider.edge_y}, "
           f"max_x={max_x}, edge_x={hider.edge_x}, "
-          f"min_travel={MIN_TRAVEL}, rotation={hider._rotation}°)", flush=True)
+          f"min_travel={MIN_TRAVEL}, rotation={hider._rotation}°, "
+          f"center=({hider._center_x},{hider._center_y}))", flush=True)
 
     try:
         for event in dev.read_loop():
