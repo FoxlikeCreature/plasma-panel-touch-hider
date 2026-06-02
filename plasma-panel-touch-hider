@@ -2,10 +2,13 @@
 """
 Hides KDE Plasma panels 5 seconds after a touchscreen edge swipe gesture.
 Reads raw evdev events in parallel with KWin - does not affect mouse behavior.
+Supports all screen rotations (portrait/landscape).
 """
 
+import json
 import subprocess
 import threading
+import time
 import sys
 
 try:
@@ -15,10 +18,11 @@ except ImportError:
     sys.exit("Install python-evdev: sudo pacman -S python-evdev")
 
 DEVICE_NAME    = "Wacom Pen and multitouch sensor Finger"
-EDGE_FRACTION  = 0.06   # top/bottom 6% of sensor height counts as edge
+EDGE_FRACTION  = 0.06   # top/bottom 6% of sensor counts as edge
 MIN_TRAVEL     = 150    # finger must move this many units inward to count as a real swipe
 MIN_DURATION   = 0.08   # real swipe takes at least 80ms; digitizer phantom is near-instant
 HIDE_DELAY     = 5.0    # seconds before hiding
+ROTATION_POLL  = 10.0   # seconds between display rotation checks
 
 HIDE_SCRIPT = (
     "for(var i=0;i<panelIds.length;i++){"
@@ -53,17 +57,50 @@ def do_hide():
         capture_output=True
     )
 
+def get_display_rotation():
+    """Returns display rotation in degrees (0, 90, 180, 270). Falls back to 0 on error.
+
+    KScreen rotation flags: 1=None(0), 2=Left(90 CCW), 4=Inverted(180), 8=Right(90 CW).
+    Portrait top corresponds to sensor X=0 for Left/CCW, X=max_x for Right/CW.
+    """
+    try:
+        r = subprocess.run(
+            ['kscreen-doctor', '-j'],
+            capture_output=True, text=True, timeout=2
+        )
+        for out in json.loads(r.stdout).get('outputs', []):
+            if out.get('enabled'):
+                return {1: 0, 2: 90, 4: 180, 8: 270}.get(out.get('rotation', 1), 0)
+    except Exception:
+        pass
+    return 0
+
 class TouchHider:
-    def __init__(self, max_y):
-        self.edge = int(max_y * EDGE_FRACTION)
-        self.max_y = max_y
+    def __init__(self, max_x, max_y):
+        self.max_y  = max_y
+        self.max_x  = max_x
+        self.edge_y = int(max_y * EDGE_FRACTION)
+        self.edge_x = int(max_x * EDGE_FRACTION)
         self._timer = None
-        self._lock = threading.Lock()
-        self._current_slot = 0
-        self._slot_start_y  = {}  # slot -> initial Y when finger went down
-        self._slot_cur_y    = {}  # slot -> most recent Y (tracks travel)
-        self._slot_start_ts = {}  # slot -> monotonic timestamp when finger went down
-        self._pending_slots = set()
+        self._lock  = threading.Lock()
+        self._current_slot  = 0
+        self._slot_start_y  = {}
+        self._slot_cur_y    = {}
+        self._slot_start_x  = {}
+        self._slot_cur_x    = {}
+        self._slot_start_ts = {}
+        self._pending_y_slots = set()
+        self._pending_x_slots = set()
+        self._rotation = get_display_rotation()
+        threading.Thread(target=self._rotation_poll, daemon=True).start()
+
+    def _rotation_poll(self):
+        while True:
+            time.sleep(ROTATION_POLL)
+            rot = get_display_rotation()
+            if rot != self._rotation:
+                self._rotation = rot
+                print(f"[touch-hider] rotation changed to {rot}°", flush=True)
 
     def _schedule(self):
         with self._lock:
@@ -72,6 +109,40 @@ class TouchHider:
             self._timer = threading.Timer(HIDE_DELAY, do_hide)
             self._timer.daemon = True
             self._timer.start()
+
+    def _check_edge(self, start_x, start_y, cur_x, cur_y):
+        """Returns (edge_name, travel) based on current rotation, or (None, 0).
+
+        For landscape (0/180), checks Y axis. For portrait (90/270), checks X axis.
+        """
+        rot = self._rotation
+        if rot in (0, 180):
+            if start_y is None:
+                return None, 0
+            if rot == 0:
+                if start_y <= self.edge_y:
+                    return "top", cur_y - start_y
+                if start_y >= self.max_y - self.edge_y:
+                    return "bottom", start_y - cur_y
+            else:
+                if start_y >= self.max_y - self.edge_y:
+                    return "top", start_y - cur_y
+                if start_y <= self.edge_y:
+                    return "bottom", cur_y - start_y
+        else:
+            if start_x is None:
+                return None, 0
+            if rot == 90:  # Left/CCW: portrait top = sensor X=0
+                if start_x <= self.edge_x:
+                    return "top", cur_x - start_x
+                if start_x >= self.max_x - self.edge_x:
+                    return "bottom", start_x - cur_x
+            else:  # 270 Right/CW: portrait top = sensor X=max_x
+                if start_x >= self.max_x - self.edge_x:
+                    return "top", start_x - cur_x
+                if start_x <= self.edge_x:
+                    return "bottom", cur_x - start_x
+        return None, 0
 
     def feed(self, event):
         if event.type != ecodes.EV_ABS:
@@ -82,40 +153,47 @@ class TouchHider:
 
         elif event.code == ecodes.ABS_MT_TRACKING_ID:
             if event.value == -1:
-                import time as _time
                 start_y  = self._slot_start_y.pop(self._current_slot, None)
                 cur_y    = self._slot_cur_y.pop(self._current_slot, start_y)
+                start_x  = self._slot_start_x.pop(self._current_slot, None)
+                cur_x    = self._slot_cur_x.pop(self._current_slot, start_x)
                 start_ts = self._slot_start_ts.pop(self._current_slot, None)
-                self._pending_slots.discard(self._current_slot)
+                self._pending_y_slots.discard(self._current_slot)
+                self._pending_x_slots.discard(self._current_slot)
 
-                if start_y is not None:
-                    is_top    = start_y <= self.edge
-                    is_bottom = start_y >= (self.max_y - self.edge)
-                    if is_top or is_bottom:
-                        travel   = cur_y - start_y if is_top else start_y - cur_y
-                        duration = (_time.monotonic() - start_ts) if start_ts else 0
-                        if travel >= MIN_TRAVEL and duration >= MIN_DURATION:
-                            edge_name = "top" if is_top else "bottom"
-                            print(f"[touch-hider] edge swipe from {edge_name} "
-                                  f"(start={start_y}, end={cur_y}, "
-                                  f"travel={travel}, dur={duration:.3f}s), "
-                                  f"hiding in {HIDE_DELAY}s", flush=True)
-                            self._schedule()
-                        else:
-                            print(f"[touch-hider] ignored "
-                                  f"(start={start_y}, end={cur_y}, "
-                                  f"travel={travel}, dur={duration:.3f}s)", flush=True)
+                duration     = (time.monotonic() - start_ts) if start_ts else 0
+                edge, travel = self._check_edge(start_x, start_y, cur_x, cur_y)
+
+                if edge is not None:
+                    if travel >= MIN_TRAVEL and duration >= MIN_DURATION:
+                        print(f"[touch-hider] edge swipe from {edge} "
+                              f"(travel={travel}, dur={duration:.3f}s, "
+                              f"rot={self._rotation}°), "
+                              f"hiding in {HIDE_DELAY}s", flush=True)
+                        self._schedule()
+                    else:
+                        print(f"[touch-hider] ignored "
+                              f"(travel={travel}, dur={duration:.3f}s)", flush=True)
             else:
                 self._slot_start_y.pop(self._current_slot, None)
                 self._slot_cur_y.pop(self._current_slot, None)
-                self._slot_start_ts[self._current_slot] = __import__('time').monotonic()
-                self._pending_slots.add(self._current_slot)
+                self._slot_start_x.pop(self._current_slot, None)
+                self._slot_cur_x.pop(self._current_slot, None)
+                self._slot_start_ts[self._current_slot] = time.monotonic()
+                self._pending_y_slots.add(self._current_slot)
+                self._pending_x_slots.add(self._current_slot)
 
         elif event.code == ecodes.ABS_MT_POSITION_Y:
-            if self._current_slot in self._pending_slots:
+            if self._current_slot in self._pending_y_slots:
                 self._slot_start_y[self._current_slot] = event.value
-                self._pending_slots.discard(self._current_slot)
+                self._pending_y_slots.discard(self._current_slot)
             self._slot_cur_y[self._current_slot] = event.value
+
+        elif event.code == ecodes.ABS_MT_POSITION_X:
+            if self._current_slot in self._pending_x_slots:
+                self._slot_start_x[self._current_slot] = event.value
+                self._pending_x_slots.discard(self._current_slot)
+            self._slot_cur_x[self._current_slot] = event.value
 
 def main():
     dev = find_touch_device()
@@ -123,9 +201,12 @@ def main():
         sys.exit(f"Device '{DEVICE_NAME}' not found or no permission (add user to 'input' group)")
 
     max_y = dev.absinfo(ecodes.ABS_MT_POSITION_Y).max
-    hider = TouchHider(max_y)
+    max_x = dev.absinfo(ecodes.ABS_MT_POSITION_X).max
+    hider = TouchHider(max_x, max_y)
     print(f"[touch-hider] watching {dev.name} "
-          f"(max_y={max_y}, edge={hider.edge}, min_travel={MIN_TRAVEL})", flush=True)
+          f"(max_y={max_y}, edge_y={hider.edge_y}, "
+          f"max_x={max_x}, edge_x={hider.edge_x}, "
+          f"min_travel={MIN_TRAVEL}, rotation={hider._rotation}°)", flush=True)
 
     try:
         for event in dev.read_loop():
